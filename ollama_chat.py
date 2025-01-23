@@ -1,84 +1,146 @@
+import sys
 import requests
 import json
-import keyboard  # 追加
 from threading import Event
+
+# Windows向けエンコーディング設定
+if sys.platform == "win32":
+    import ctypes
+    kernel32 = ctypes.windll.kernel32
+    kernel32.SetConsoleCP(65001)
+    kernel32.SetConsoleOutputCP(65001)
 
 OLLAMA_API_URL = "http://localhost:11434"
 COLOR = {
     "user": "\033[34m",
-    "model": "\033[32m",
-    "reset": "\033[0m"
+    "reset": "\033[0m",
+    "model": "\033[32m"
 }
 
-def get_models():
+def clear_input_buffer():
+    """プラットフォーム別入力バッファクリア"""
     try:
-        response = requests.get(f"{OLLAMA_API_URL}/api/tags")
-        return [m["name"] for m in response.json().get("models", [])]
+        if sys.platform == "win32":
+            import msvcrt
+            while msvcrt.kbhit():
+                msvcrt.getch()
+        else:
+            import termios
+            import tty
+            fd = sys.stdin.fileno()
+            old_settings = termios.tcgetattr(fd)
+            try:
+                tty.setraw(fd)
+                while sys.stdin.read(1) == '': pass
+            finally:
+                termios.tcsetattr(fd, termios.TCSADRAIN, old_settings)
     except Exception:
+        pass
+
+def safe_input(prompt):
+    """安全な入力処理（EOF/エンコーディング対応）"""
+    for _ in range(3):
+        try:
+            clear_input_buffer()
+            if sys.stdin.encoding.lower() in ('cp932', 'shift_jis', 'mbcs'):
+                return input(prompt).encode(sys.stdin.encoding, errors='replace').decode('utf-8')
+            return input(prompt)
+        except UnicodeDecodeError:
+            print("文字化けを検出しました。再入力してください。")
+        except EOFError:
+            print("\n入力が中断されました")
+            return "/exit"
+    return ""
+
+def get_models():
+    """利用可能なモデル一覧を取得"""
+    try:
+        response = requests.get(f"{OLLAMA_API_URL}/api/tags", timeout=10)
+        response.raise_for_status()
+        return [m["name"] for m in response.json().get("models", [])]
+    except (requests.RequestException, json.JSONDecodeError, KeyError) as e:
+        print(f"モデル取得エラー: {e}")
         return []
 
 def select_model(models):
+    """モデル選択インタフェース"""
     print("\n利用可能なモデル:")
     for i, model in enumerate(models):
         print(f"{i+1}. {model}")
     
     while True:
-        choice = input("\nモデル番号を入力 (0で終了): ")
-        if choice == "0":
+        choice = safe_input("\nモデル番号を入力 (0で終了): ").strip()
+        if choice in ("0", "/exit"):
+            print("プログラムを終了します")
             exit()
-        if choice.isdigit() and 0 < int(choice) <= len(models):
+        if choice.isdigit() and 1 <= int(choice) <= len(models):
             return models[int(choice)-1]
         print("無効な入力です")
 
 def chat_session(model):
-    print(f"\n{model}でチャット開始 (ESCキー押してENTER'/exit'でLLM選択に戻る)")  # 説明文更新
-    exit_event = Event()
-    
-    def on_esc_pressed(e):
-        if e.event_type == keyboard.KEY_DOWN and e.name == 'esc':
-            exit_event.set()
-            keyboard.unhook_all()
-            print("\n")  # 改行を追加
-            
-    keyboard.hook(on_esc_pressed)  # ESCキー監視開始
+    """チャットセッション管理"""
+    response = None
+    try:
+        print(f"\n{model}でチャット開始 (Ctrl+Cで中断)")
+        while True:
+            try:
+                prompt = safe_input(f"{COLOR['user']}あなた: {COLOR['reset']}").strip()
+                if not prompt:
+                    continue
+                
+                # APIリクエスト処理
+                try:
+                    response = requests.post(
+                        f"{OLLAMA_API_URL}/api/chat",
+                        json={"model": model, "messages": [{"role": "user", "content": prompt}]},
+                        stream=True,
+                        timeout=60
+                    )
+                    response.raise_for_status()
+                except requests.RequestException as e:
+                    print(f"\nリクエストエラー: {e}")
+                    continue
 
-    while not exit_event.is_set():
-        try:
-            prompt = input(f"{COLOR['user']}あなた: {COLOR['reset']}").strip()
-            if prompt == "/exit" or exit_event.is_set():
+                # レスポンス処理
+                print(f"{COLOR['model']}{model}: ", end="", flush=True)
+                try:
+                    for line in response.iter_lines():
+                        if line:
+                            try:
+                                chunk = json.loads(line).get("message", {}).get("content", "")
+                                print(chunk, end="", flush=True)
+                            except json.JSONDecodeError:
+                                continue
+                finally:
+                    print(COLOR['reset'], end="", flush=True)
+                print("\n")
+
+            except KeyboardInterrupt:
+                print(COLOR['reset'] + "\n中断されました", flush=True)
                 break
-            
-            # APIリクエスト処理
-            response = requests.post(
-                f"{OLLAMA_API_URL}/api/chat",
-                json={"model": model, "messages": [{"role": "user", "content": prompt}]},
-                stream=True
-            )
-            
-            print(f"{COLOR['model']}{model}: ", end="", flush=True)
-            for line in response.iter_lines():
-                if exit_event.is_set():
-                    break
-                if line:
-                    chunk = json.loads(line).get("message", {}).get("content", "")
-                    print(chunk, end="", flush=True)
-            print(COLOR['reset'] + "\n")
-            
-        except Exception as e:
-            print(f"エラー: {e}")
-    
-    keyboard.unhook_all()  # キー監視終了
+
+    finally:
+        if response:
+            response.close()
+        print(COLOR['reset'] + "セッションを終了します\n" + "="*50)
 
 def main():
+    """メイン処理"""
     models = get_models()
     if not models:
-        print("モデルが見つかりません")
+        print("利用可能なモデルが見つかりません")
         return
     
-    while True:
-        model = select_model(models)
-        chat_session(model)
-        print("\n" + "="*50)
+    try:
+        while True:
+            try:
+                model = select_model(models)
+                chat_session(model)
+            except KeyboardInterrupt:
+                print("\nメインメニューに戻ります")
+                continue
+    except KeyboardInterrupt:
+        print("\nプログラムを終了します")
 
 if __name__ == "__main__":
     main()

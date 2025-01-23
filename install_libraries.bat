@@ -1,10 +1,14 @@
 @echo off
 chcp 65001 > nul
-echo 必要なライブラリをインストールします...
-echo （管理者権限が必要な場合があります）
-
-python -m pip install --upgrade pip
-pip install requests keyboard
-
-echo インストール完了！
+echo 依存ライブラリをインストールします...
+pip install requests pykakasi
+if %errorlevel% neq 0 (
+    echo エラーが発生しました。以下の点を確認してください：
+    echo 1. Pythonがインストールされているか
+    echo 2. pipがPATHに登録されているか
+    echo 3. インターネット接続状態
+    pause
+    exit /b 1
+)
+echo インストールが正常に完了しました！
 pause
