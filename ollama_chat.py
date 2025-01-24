@@ -2,6 +2,7 @@ import sys
 import requests
 import json
 from threading import Event
+from datetime import datetime
 
 # Windows向けエンコーディング設定
 if sys.platform == "win32":
@@ -12,9 +13,12 @@ if sys.platform == "win32":
 
 OLLAMA_API_URL = "http://localhost:11434"
 COLOR = {
-    "user": "\033[34m",
-    "reset": "\033[0m",
-    "model": "\033[32m"
+    "user": "\033[34m",    # 青
+    "reset": "\033[0m",    # リセット
+    "model": "\033[32m",   # 緑
+    "number": "\033[33m",  # 黄
+    "model_name": "\033[36m",  # シアン
+    "date": "\033[35m"     # マゼンタ
 }
 
 def clear_input_buffer():
@@ -53,35 +57,47 @@ def safe_input(prompt):
     return ""
 
 def get_models():
-    """利用可能なモデル一覧を取得"""
+    """改良版モデル情報取得（日時情報含む）"""
     try:
         response = requests.get(f"{OLLAMA_API_URL}/api/tags", timeout=10)
         response.raise_for_status()
-        return [m["name"] for m in response.json().get("models", [])]
-    except (requests.RequestException, json.JSONDecodeError, KeyError) as e:
+        return sorted(
+            [{"name": m["name"], 
+              "modified": datetime.fromisoformat(m["modified_at"].rstrip('Z'))}
+             for m in response.json().get("models", [])],
+            key=lambda x: x["modified"], 
+            reverse=True
+        )
+    except Exception as e:
         print(f"モデル取得エラー: {e}")
         return []
 
 def select_model(models):
-    """モデル選択インタフェース"""
-    print("\n利用可能なモデル:")
+    """カラー表示付きモデル選択インタフェース"""
+    print(f"\n{COLOR['number']}番号 {COLOR['model_name']}モデル名 {COLOR['date']}DL日時{COLOR['reset']}")
+    
     for i, model in enumerate(models):
-        print(f"{i+1}. {model}")
+        local_time = model["modified"].astimezone().strftime('%Y-%m-%d %H:%M')
+        print(
+            f"{COLOR['number']}{i+1:2d}. "
+            f"{COLOR['model_name']}{model['name'][:20]:<20} "
+            f"{COLOR['date']}[DL: {local_time}]{COLOR['reset']}"
+        )
     
     while True:
-        choice = safe_input("\nモデル番号を入力 (0で終了): ").strip()
+        choice = safe_input("\n選択するモデルの番号を入力 (0で終了): ").strip()
         if choice in ("0", "/exit"):
             print("プログラムを終了します")
             exit()
         if choice.isdigit() and 1 <= int(choice) <= len(models):
-            return models[int(choice)-1]
+            return models[int(choice)-1]["name"]
         print("無効な入力です")
 
 def chat_session(model):
     """チャットセッション管理"""
     response = None
     try:
-        print(f"\n{model}でチャット開始 (Ctrl+Cで中断)")
+        print(f"\n{model}でチャット開始 (Ctrl+Cで中断&モデル選択)")
         while True:
             try:
                 prompt = safe_input(f"{COLOR['user']}あなた: {COLOR['reset']}").strip()
@@ -130,7 +146,6 @@ def main():
     if not models:
         print("利用可能なモデルが見つかりません")
         return
-    
     try:
         while True:
             try:
