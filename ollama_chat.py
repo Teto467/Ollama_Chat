@@ -15,12 +15,13 @@ kernel32.SetConsoleOutputCP(65001)
 
 OLLAMA_API_URL = "http://localhost:11434"
 COLOR = {
-    "user": "\033[34m",    # 青
-    "reset": "\033[0m",    # リセット
-    "model": "\033[32m",   # 緑
-    "number": "\033[33m",  # 黄
-    "model_name": "\033[36m",  # シアン
-    "date": "\033[35m"     # マゼンタ
+"user": "\033[34m", # 青
+"reset": "\033[0m", # リセット
+"model": "\033[32m", # 緑
+"number": "\033[33m", # 黄
+"model_name": "\033[36m", # シアン
+"date": "\033[35m", # マゼンタ
+"white": "\033[37m" # 白
 }
 
 class TIME_ZONE_INFORMATION(ctypes.Structure):
@@ -89,19 +90,18 @@ def get_models():
 
 def select_model(models):
     """モデル選択インタフェース（Windows最適化版）"""
-    current_tz = get_local_timezone().tzname(datetime.now())
-    print(f"\n{COLOR['number']}番号 {COLOR['model_name']}モデル名  {COLOR['date']}更新日時 ({current_tz}){COLOR['reset']}")
+    print(f"\n{COLOR['number']}番号 {COLOR['model_name']}モデル名 {COLOR['date']}                 ダウンロード日時{COLOR['reset']}")  # 変更箇所
     
     for i, model in enumerate(models):
-        time_str = model["modified"].strftime('%Y-%m-%d %H:%M')
+        time_str = model["modified"].strftime('%Y-%m-%d %H:%M')  # タイムゾーン名削除
         print(
             f"{COLOR['number']}{i+1:2d}. "
-            f"{COLOR['model_name']}{model['name'][:25]:<25} "
+            f" {COLOR['model_name']}{model['name'][:25]:<25} "
             f"{COLOR['date']}{time_str}{COLOR['reset']}"
         )
     
     while True:
-        choice = safe_input("\nモデル番号を入力 (0で終了): ").strip()
+        choice = safe_input(f"\n{COLOR['white']}モデル{COLOR['number']}番号{COLOR['white']}を入力 (0で終了): ").strip()
         if choice in ("0", "/exit"):
             print("プログラムを終了します")
             exit()
