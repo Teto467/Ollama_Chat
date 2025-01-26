@@ -7,6 +7,7 @@ import json
 import gc
 import psutil
 import time
+from typing import Optional
 import concurrent.futures
 from datetime import datetime
 from itertools import cycle
@@ -123,6 +124,8 @@ def preload_model(model_name):
         print(f"\n{COLOR['divider']}[!] プリロード失敗: {e}{COLOR['reset']}")
     finally:
         current_preload_model = None
+
+
 def select_model(models):
     """モデル選択インタフェース（Windows最適化版）"""
     # ヘッダー作成
@@ -225,121 +228,152 @@ def monitor_resources():
     print(f" [GPU: {gpu_info.used/1024**2:.1f}MB | CPU: {cpu_usage}% | RAM: {mem_usage:.2f}GB]")
 
 
-def chat_session(model):
-    """非同期処理＆GPU最適化版チャットセッション（モデル名表示版）"""
-    response = None
-    torch = None
-    handle = None
+def initialize_gpu_resources() -> dict:
+    """GPUリソースの初期化と設定を管理"""
+    gpu_context = {
+        'use_cuda': False,
+        'torch': None,
+        'handle': None
+    }
+    
     try:
-        # GPUリソース初期化
-        use_cuda = False
-        try:
-            import torch
-            from pynvml import nvmlInit, nvmlDeviceGetHandleByIndex, nvmlDeviceGetMemoryInfo
-            nvmlInit()
-            if torch.cuda.is_available():
-                use_cuda = True
-                device = torch.device("cuda")
-                torch.cuda.init()
-                torch.cuda.empty_cache()
-                torch.cuda.set_per_process_memory_fraction(0.9, device=0)
-                torch.backends.cuda.matmul.allow_tf32 = True
-                torch.backends.cudnn.benchmark = True
-                torch.backends.cuda.enable_flash_sdp(True)
-                torch.backends.cuda.enable_mem_efficient_sdp(True)
-                handle = nvmlDeviceGetHandleByIndex(0)
-                gpu_name = nvmlDeviceGetName(handle)
-                gpu_mem = nvmlDeviceGetMemoryInfo(handle)
-                print(f"{COLOR['divider']}―――――――――――――――――――――――――――――――{COLOR['reset']}")
-                print(f"{COLOR['model']}⚡ CUDA有効: {gpu_name} [VRAM: {gpu_mem.free/1024**3:.1f}GB 空き]{COLOR['reset']}")
-                os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "max_split_size_mb:128"
-        except Exception as e:
-            print(f"{COLOR['divider']}―――――――――――――――――――――――――――――――")
-            print(f"{COLOR['model']}⚠ GPU初期化エラー: {e}{COLOR['reset']}")
-            use_cuda = False
+        import torch
+        from pynvml import nvmlInit, nvmlDeviceGetHandleByIndex, nvmlDeviceGetName, nvmlDeviceGetMemoryInfo
+        
+        nvmlInit()
+        if torch.cuda.is_available():
+            device = torch.device("cuda")
+            torch.cuda.init()
+            
+            # CUDA最適化設定
+            torch.cuda.set_per_process_memory_fraction(0.9, device=0)
+            torch.backends.cuda.matmul.allow_tf32 = True
+            torch.backends.cudnn.benchmark = True
+            torch.backends.cuda.enable_flash_sdp(True)
+            torch.backends.cuda.enable_mem_efficient_sdp(True)
+            
+            # GPUメモリ情報取得
+            handle = nvmlDeviceGetHandleByIndex(0)
+            gpu_name = nvmlDeviceGetName(handle)
+            gpu_mem = nvmlDeviceGetMemoryInfo(handle)
+            
+            print(f"{COLOR['divider']}―――――――――――――――――――――――――――――――{COLOR['reset']}")
+            print(f"{COLOR['model']}⚡ CUDA有効: {gpu_name} [VRAM: {gpu_mem.free/1024**3:.1f}GB 空き]{COLOR['reset']}")
+            os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "max_split_size_mb:128"
+            
+            gpu_context.update({
+                'use_cuda': True,
+                'torch': torch,
+                'handle': handle
+            })
+            
+    except Exception as e:
+        print(f"{COLOR['divider']}―――――――――――――――――――――――――――――――")
+        print(f"{COLOR['model']}⚠ GPU初期化エラー: {e}{COLOR['reset']}")
+    
+    return gpu_context
 
-        # Windowsプロセス優先度設定
-        kernel32.SetPriorityClass(kernel32.GetCurrentProcess(), 0x00000080)
+def set_high_process_priority():
+    """Windowsプロセスの優先度を設定"""
+    kernel32.SetPriorityClass(kernel32.GetCurrentProcess(), 0x00000080)
 
+def create_request_payload(model: str, prompt: str, use_cuda: bool) -> dict:
+    """リクエストペイロードを生成"""
+    return {
+        "model": model,
+        "messages": [{"role": "user", "content": prompt}],
+        "stream": True,
+        "options": {
+            "num_ctx": 4096,
+            "num_thread": 8 if use_cuda else os.cpu_count(),
+            "num_batch": 512,
+            "flash_attention": True
+        }
+    }
+
+def handle_chat_response(response: requests.Response, model: str, executor: concurrent.futures.Executor, gpu_context: dict):
+    """レスポンス処理と非同期タスク管理"""
+    future = None
+    try:
+        print(f"{COLOR['model']}{model}: ", end="", flush=True)
+        future = executor.submit(process_stream, response, model)
+        
+        while not future.done():
+            if gpu_context['use_cuda']:
+                kernel32.SetProcessWorkingSetSize(-1, 1024*1024*1024, -1)
+                gpu_context['torch'].cuda.empty_cache()
+            time.sleep(0.05)
+            
+        future.result()
+        print(f"\n{COLOR['divider']}―――――――――――――――――――――――――――――――")
+        
+    finally:
+        if future:
+            future.cancel()
+
+def run_chat_loop(model: str, gpu_context: dict):
+    """チャットセッションのメインループ"""
+    with concurrent.futures.ThreadPoolExecutor(
+        max_workers=2,
+        thread_name_prefix='OllamaStream'
+    ) as executor:
+        while True:
+            try:
+                prompt = safe_input(f"{COLOR['user']}あなた: {COLOR['reset']}").strip()
+                if not prompt or prompt.lower() == "/exit":
+                    return
+
+                payload = create_request_payload(model, prompt, gpu_context['use_cuda'])
+                
+                with requests.post(
+                    f"{OLLAMA_API_URL}/api/chat",
+                    json=payload,
+                    stream=True,
+                    timeout=150
+                ) as response:
+                    response.raise_for_status()
+                    handle_chat_response(response, model, executor, gpu_context)
+                
+                if gpu_context['use_cuda']:
+                    gpu_context['torch'].cuda.empty_cache()
+                gc.collect()
+                
+            except KeyboardInterrupt:
+                print(f"{COLOR['divider']}―――――――――――――――――――――――――――――――")
+                print(f"{COLOR['reset']}\n入力を中断しました")
+                break
+            except requests.exceptions.RequestException as e:
+                print(f"\n{COLOR['divider']}―――――――――――――――――――――――――――――――")
+                print(f"通信エラー: {e}")
+
+def cleanup_resources(response: Optional[requests.Response], gpu_context: dict):
+    """リソースのクリーンアップ処理"""
+    if response:
+        response.close()
+    if gpu_context['torch'] is not None and gpu_context['use_cuda']:
+        gpu_context['torch'].cuda.synchronize()
+        gpu_context['torch'].cuda.empty_cache()
+        gpu_context['torch'].cuda.reset_peak_memory_stats()
+    kernel32.SetPriorityClass(kernel32.GetCurrentProcess(), 0x00000020)
+
+def chat_session(model: str):
+    """分割後のメイン関数"""
+    response = None
+    gpu_context = initialize_gpu_resources()
+    
+    try:
+        set_high_process_priority()
         print(f"\n{COLOR['divider']}―――――――――――――――――――――――――――――――")
         print(f"{COLOR['model_name']} チャット開始: {model}{COLOR['reset']}")
         print(f"{COLOR['divider']}―――――――――――――――――――――――――――――――{COLOR['reset']}\n")
-
-        with concurrent.futures.ThreadPoolExecutor(
-            max_workers=2,
-            thread_name_prefix='OllamaStream'
-        ) as executor:
-            while True:
-                try:
-                    # ユーザー入力
-                    prompt = safe_input(f"{COLOR['user']}あなた: {COLOR['reset']}").strip()
-                    if not prompt or prompt.lower() == "/exit":
-                        return
-
-                    # リクエスト設定
-                    payload = {
-                        "model": model,
-                        "messages": [{"role": "user", "content": prompt}],
-                        "stream": True,
-                        "options": {
-                            "num_ctx": 4096,
-                            "num_thread": 8 if use_cuda else os.cpu_count(),
-                            "num_batch": 512,
-                            "flash_attention": True
-                        }
-                    }
-
-                    # 非同期リクエスト実行
-                    future = None
-                    with requests.post(
-                        f"{OLLAMA_API_URL}/api/chat",
-                        json=payload,
-                        stream=True,
-                        timeout=150
-                    ) as response:
-                        response.raise_for_status()
-
-                        print(f"{COLOR['model']}{model}: ", end="", flush=True)
-                        future = executor.submit(process_stream, response, model)
-                        
-                        while not future.done():
-                            if use_cuda:
-                                kernel32.SetProcessWorkingSetSize(-1, 1024*1024*1024, -1)
-                                torch.cuda.empty_cache()
-                            time.sleep(0.05)
-
-                        future.result()
-                        print(f"\n{COLOR['divider']}―――――――――――――――――――――――――――――――")
-
-                    # メモリクリア
-                    del payload
-                    if use_cuda:
-                        torch.cuda.empty_cache()
-                    gc.collect()
-                    print(COLOR['reset'])
-
-                except KeyboardInterrupt:
-                    print(f"{COLOR['divider']}―――――――――――――――――――――――――――――――")
-                    print(f"{COLOR['reset']}\n入力を中断しました")
-                    if future: future.cancel()
-                    break
-                except requests.exceptions.RequestException as e:
-                    print(f"\n{COLOR['divider']}―――――――――――――――――――――――――――――――")
-                    print(f"通信エラー: {e}")
-                    if future: future.cancel()
-
+        
+        run_chat_loop(model, gpu_context)
+        
     except Exception as e:
         print(f"\n{COLOR['divider']}―――――――――――――――――――――――――――――――")
         print(f"予期せぬエラー: {e}")
     finally:
-        # リソース完全解放
-        if response:
-            response.close()
-        if torch is not None and use_cuda:
-            torch.cuda.synchronize()
-            torch.cuda.empty_cache()
-            torch.cuda.reset_peak_memory_stats()
-        kernel32.SetPriorityClass(kernel32.GetCurrentProcess(), 0x00000020)
+        cleanup_resources(response, gpu_context)
         print(f"{COLOR['divider']}―――――――――――――――――――――――――――――――")
         print(f"{COLOR['reset']}セッションを終了します\n" + "="*60)
 
