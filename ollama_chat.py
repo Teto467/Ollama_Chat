@@ -9,6 +9,10 @@ import psutil
 import time
 import concurrent.futures
 from datetime import datetime
+from itertools import cycle
+import signal
+from ctypes import wintypes
+from tenacity import retry, stop_after_attempt, wait_exponential
 from pynvml import (
     nvmlInit,
     nvmlDeviceGetHandleByIndex,
@@ -19,19 +23,24 @@ from pynvml import (
 # Windows API定義
 kernel32 = ctypes.windll.kernel32
 
+# プログレス表示用
+SPINNER = cycle(['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏'])
+
 # コンソール設定
 kernel32.SetConsoleCP(65001)
 kernel32.SetConsoleOutputCP(65001)
 
 OLLAMA_API_URL = "http://localhost:11434"
 COLOR = {
-"user": "\033[34m", # 青
-"reset": "\033[0m", # リセット
-"model": "\033[32m", # 緑
-"number": "\033[33m", # 黄
-"model_name": "\033[36m", # シアン
-"date": "\033[35m", # マゼンタ
-"white": "\033[37m" # 白
+    "user": "\033[34m",  # 青
+    "reset": "\033[0m",  # リセット
+    "model": "\033[32m",  # 緑
+    "number": "\033[33m",  # 黄
+    "model_name": "\033[36m",  # シアン
+    "date": "\033[35m",  # マゼンタ
+    "white": "\033[37m",  # 白 ← ここにカンマを追加
+    "divider": "\033[90m",  # 明るいグレー
+    "highlight": "\033[1;36m"  # シアン＋太字
 }
 
 class TIME_ZONE_INFORMATION(ctypes.Structure):
@@ -98,39 +107,110 @@ def get_models():
         print(f"モデル取得エラー: {e}")
         return []
 
+def preload_model(model_name):
+    """モデルをバックグラウンドでプリロード"""
+    global current_preload_model
+    try:
+        current_preload_model = model_name
+        # 実際のモデルロード処理（仮の実装）
+        response = requests.post(
+            f"{OLLAMA_API_URL}/api/load",
+            json={"model": model_name, "keep_alive": "5m"}
+        )
+        response.raise_for_status()
+        print(f"\n{COLOR['divider']}[✓] {model_name} プリロード完了{COLOR['reset']}")
+    except Exception as e:
+        print(f"\n{COLOR['divider']}[!] プリロード失敗: {e}{COLOR['reset']}")
+    finally:
+        current_preload_model = None
 def select_model(models):
     """モデル選択インタフェース（Windows最適化版）"""
-    print(f"\n{COLOR['number']}番号 {COLOR['model_name']}モデル名 {COLOR['date']}                 ダウンロード日時{COLOR['reset']}")  # 変更箇所
+    # ヘッダー作成
+    header = (
+        f"{COLOR['divider']}┌{'─'*5}┬{'─'*25}┬{'─'*19}┐{COLOR['reset']}\n"
+        f"{COLOR['number']}  No. {COLOR['divider']}│{COLOR['model_name']} モデル名{' '*18} "
+        f"{COLOR['divider']}│{COLOR['date']} 更新日時{' '*11} {COLOR['divider']}│{COLOR['reset']}"
+    )
     
+    # ボディ作成
+    body = []
     for i, model in enumerate(models):
-        time_str = model["modified"].strftime('%Y-%m-%d %H:%M')  # タイムゾーン名削除
-        print(
-            f"{COLOR['number']}{i+1:2d}. "
-            f" {COLOR['model_name']}{model['name'][:25]:<25} "
-            f"{COLOR['date']}{time_str}{COLOR['reset']}"
+        time_str = model["modified"].strftime('%Y-%m-%d %H:%M')
+        body_line = (
+            f"{COLOR['divider']}├{'─'*5}┼{'─'*25}┼{'─'*19}┤{COLOR['reset']}\n"
+            f"{COLOR['number']}{i+1:>4}  {COLOR['divider']}│ "
+            f"{COLOR['model_name']}{model['name'][:23]:<23} {COLOR['divider']}│ "
+            f"{COLOR['date']}{time_str} {COLOR['divider']}│"
         )
+        body.append(body_line)
     
+    # フッター作成
+    footer = f"{COLOR['divider']}└{'─'*5}┴{'─'*25}┴{'─'*19}┘{COLOR['reset']}"
+    
+    # 全体表示
+    print(f"\n{header}\n" + "\n".join(body) + f"\n{footer}")
+    
+    # 入力処理
     while True:
-        choice = safe_input(f"\n{COLOR['white']}モデル{COLOR['number']}番号{COLOR['white']}を入力 (0で終了): ").strip()
+        choice = safe_input(
+            f"\n{COLOR['highlight']}🡢 {COLOR['white']}モデル{COLOR['number']}No.{COLOR['white']}を入力"
+            f"{COLOR['divider']} [0:終了] {COLOR['reset']}"
+        ).strip()
+        
         if choice in ("0", "/exit"):
+            print(f"{COLOR['divider']}―――――――――――――――――――――――――――――――{COLOR['reset']}")
             print("プログラムを終了します")
             exit()
         if choice.isdigit() and 1 <= int(choice) <= len(models):
             return models[int(choice)-1]["name"]
-        print("無効な入力です")
+        
+        print(
+            f"{COLOR['divider']}[!] {COLOR['number']}1〜{len(models)}の数値で入力してください"
+            f"{COLOR['reset']}"
+        )
 
 def safe_input(prompt):
-    """Windowsコンソール向け入力処理"""
-    for _ in range(3):
-        try:
-            clear_input_buffer()
-            return input(prompt)
-        except UnicodeDecodeError:
-            print("文字化けを検出しました。再入力してください。")
-        except EOFError:
-            print("\n入力が中断されました")
-            return "/exit"
-    return ""
+    """Windows向け強化版入力処理（シグナル対応）"""
+    h_input = kernel32.GetStdHandle(-10)
+    original_mode = wintypes.DWORD()
+    kernel32.GetConsoleMode(h_input, ctypes.byref(original_mode))
+    
+    # シグナルハンドラを保存
+    original_sigint = signal.getsignal(signal.SIGINT)
+    buf = ctypes.create_unicode_buffer(256)
+    received_signal = [False]
+
+    def handler(signum, frame):
+        received_signal[0] = True
+        print("\n中断信号を検知")
+
+    try:
+        # シグナルハンドラ設定
+        signal.signal(signal.SIGINT, handler)
+        
+        # コンソールモード設定
+        new_mode = original_mode.value | 0x0002 | 0x0004 | 0x0001  # ENABLE flags
+        kernel32.SetConsoleMode(h_input, new_mode)
+        
+        print(prompt, end='', flush=True)
+        chars_read = wintypes.DWORD()
+        
+        # 入力を非同期で監視
+        while not received_signal[0]:
+            if kernel32.WaitForSingleObject(h_input, 100) == 0:
+                if kernel32.ReadConsoleW(h_input, buf, len(buf)-1, ctypes.byref(chars_read), None):
+                    return buf.value[:chars_read.value].strip()
+                break
+        return ""
+    
+    finally:
+        # クリーンアップ処理
+        kernel32.SetConsoleMode(h_input, original_mode)
+        signal.signal(signal.SIGINT, original_sigint)
+        while msvcrt.kbhit():
+            msvcrt.getwch()
+        if received_signal[0]:
+            raise KeyboardInterrupt("入力がユーザーにより中断されました")
 
 def monitor_resources():
     """GPU/CPUリソース監視"""
@@ -146,7 +226,7 @@ def monitor_resources():
 
 
 def chat_session(model):
-    """非同期処理＆GPU最適化版チャットセッション"""
+    """非同期処理＆GPU最適化版チャットセッション（モデル名表示版）"""
     response = None
     torch = None
     handle = None
@@ -155,7 +235,7 @@ def chat_session(model):
         use_cuda = False
         try:
             import torch
-            from pynvml import nvmlInit, nvmlDeviceGetHandleByIndex, nvmlDeviceGetMemoryInfo, nvmlDeviceGetName
+            from pynvml import nvmlInit, nvmlDeviceGetHandleByIndex, nvmlDeviceGetMemoryInfo
             nvmlInit()
             if torch.cuda.is_available():
                 use_cuda = True
@@ -165,16 +245,30 @@ def chat_session(model):
                 torch.cuda.set_per_process_memory_fraction(0.9, device=0)
                 torch.backends.cuda.matmul.allow_tf32 = True
                 torch.backends.cudnn.benchmark = True
+                torch.backends.cuda.enable_flash_sdp(True)
+                torch.backends.cuda.enable_mem_efficient_sdp(True)
                 handle = nvmlDeviceGetHandleByIndex(0)
                 gpu_name = nvmlDeviceGetName(handle)
                 gpu_mem = nvmlDeviceGetMemoryInfo(handle)
-                print(f"{COLOR['model']}CUDA有効: {gpu_name} [VRAM: {gpu_mem.free/1024**3:.1f}GB 空き]{COLOR['reset']}\n")
+                print(f"{COLOR['divider']}―――――――――――――――――――――――――――――――{COLOR['reset']}")
+                print(f"{COLOR['model']}⚡ CUDA有効: {gpu_name} [VRAM: {gpu_mem.free/1024**3:.1f}GB 空き]{COLOR['reset']}")
+                os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "max_split_size_mb:128"
         except Exception as e:
-            print(f"{COLOR['model']}GPU初期化エラー: {e}{COLOR['reset']}")
+            print(f"{COLOR['divider']}―――――――――――――――――――――――――――――――")
+            print(f"{COLOR['model']}⚠ GPU初期化エラー: {e}{COLOR['reset']}")
             use_cuda = False
 
-        print(f"{COLOR['model_name']}{model}{COLOR['reset']} でチャット開始 (Ctrl+Cで中断)")
-        with concurrent.futures.ThreadPoolExecutor(max_workers=2) as executor:
+        # Windowsプロセス優先度設定
+        kernel32.SetPriorityClass(kernel32.GetCurrentProcess(), 0x00000080)
+
+        print(f"\n{COLOR['divider']}―――――――――――――――――――――――――――――――")
+        print(f"{COLOR['model_name']} チャット開始: {model}{COLOR['reset']}")
+        print(f"{COLOR['divider']}―――――――――――――――――――――――――――――――{COLOR['reset']}\n")
+
+        with concurrent.futures.ThreadPoolExecutor(
+            max_workers=2,
+            thread_name_prefix='OllamaStream'
+        ) as executor:
             while True:
                 try:
                     # ユーザー入力
@@ -188,16 +282,10 @@ def chat_session(model):
                         "messages": [{"role": "user", "content": prompt}],
                         "stream": True,
                         "options": {
-                            "num_gpu": 1 if use_cuda else 0,
                             "num_ctx": 4096,
+                            "num_thread": 8 if use_cuda else os.cpu_count(),
                             "num_batch": 512,
-                            "main_gpu": 0,
-                            "low_vram": False,
-                            "f16_kv": True,
-                            "flash_attention": True,
-                            "mmap": True,
-                            "mlock": False,
-                            "num_thread": 1 if use_cuda else max(1, os.cpu_count()//2)
+                            "flash_attention": True
                         }
                     }
 
@@ -212,42 +300,37 @@ def chat_session(model):
                         response.raise_for_status()
 
                         print(f"{COLOR['model']}{model}: ", end="", flush=True)
-                        buffer = bytearray()
-
-                        # ストリーミング処理を別スレッドで実行
-                        future = executor.submit(
-                            process_stream,
-                            response,
-                            model
-                        )
-                        # メインスレッドでリソース監視
+                        future = executor.submit(process_stream, response, model)
+                        
                         while not future.done():
                             if use_cuda:
-                                gpu_info = nvmlDeviceGetMemoryInfo(handle)
-                                gpu_usage = gpu_info.used / gpu_info.total
-                                if gpu_usage < 0.5:
-                                    torch.cuda.empty_cache()
+                                kernel32.SetProcessWorkingSetSize(-1, 1024*1024*1024, -1)
+                                torch.cuda.empty_cache()
                             time.sleep(0.05)
 
-                        future.result()  # 完了を待機
+                        future.result()
+                        print(f"\n{COLOR['divider']}―――――――――――――――――――――――――――――――")
 
                     # メモリクリア
-                    del payload, buffer
+                    del payload
                     if use_cuda:
                         torch.cuda.empty_cache()
                     gc.collect()
-                    print(COLOR['reset'] + "\n")
+                    print(COLOR['reset'])
 
                 except KeyboardInterrupt:
-                    print(COLOR['reset'] + "\n入力を中断しました")
+                    print(f"{COLOR['divider']}―――――――――――――――――――――――――――――――")
+                    print(f"{COLOR['reset']}\n入力を中断しました")
                     if future: future.cancel()
                     break
                 except requests.exceptions.RequestException as e:
-                    print(f"\n通信エラー: {e}")
+                    print(f"\n{COLOR['divider']}―――――――――――――――――――――――――――――――")
+                    print(f"通信エラー: {e}")
                     if future: future.cancel()
 
     except Exception as e:
-        print(f"\n予期せぬエラー: {e}")
+        print(f"\n{COLOR['divider']}―――――――――――――――――――――――――――――――")
+        print(f"予期せぬエラー: {e}")
     finally:
         # リソース完全解放
         if response:
@@ -256,30 +339,45 @@ def chat_session(model):
             torch.cuda.synchronize()
             torch.cuda.empty_cache()
             torch.cuda.reset_peak_memory_stats()
-        print(COLOR['reset'] + "セッションを終了します\n" + "="*60)
-
+        kernel32.SetPriorityClass(kernel32.GetCurrentProcess(), 0x00000020)
+        print(f"{COLOR['divider']}―――――――――――――――――――――――――――――――")
+        print(f"{COLOR['reset']}セッションを終了します\n" + "="*60)
 
 
 def process_stream(response, model):
-    """非同期ストリーミング処理（バッファ管理修正版）"""
+    """未加工のストリーミング出力処理"""
     buffer = bytearray()
+    token_count = 0
+    start_time = time.perf_counter()
+    
     try:
-        for chunk in response.iter_content(chunk_size=4096):
+        for chunk in response.iter_content(chunk_size=8192):
             if chunk:
                 buffer.extend(chunk)
                 while b'\n' in buffer:
                     line, _, buffer = buffer.partition(b'\n')
+                    if not line:
+                        continue
+                    
                     try:
                         data = json.loads(line)
                         content = data.get("message", {}).get("content", "")
+                        # 未加工のコンテンツをそのまま出力
                         print(content, end="", flush=True)
-                        del data
-                        if len(content) % 50 == 0:
-                            gc.collect(1)
+                        token_count += len(content.split())
+                            
                     except json.JSONDecodeError:
                         continue
+                    
+        elapsed = time.perf_counter() - start_time
+        tps = token_count / elapsed if elapsed > 0 else 0
+        print(f"\n{COLOR['divider']}―――――――――――――――――――――――――――――――")
+        print(f"{COLOR['number']}⚡ 処理速度: {tps:.1f} tokens/sec")
+        
     except Exception as e:
         print(f"\nストリーミングエラー: {e}")
+        raise
+    
     return buffer
 
 def main():
