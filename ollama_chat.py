@@ -17,18 +17,22 @@ COLOR = {
 }
 
 def format_iso_date(iso_str: str) -> str:
+    """ISO 8601日時をローカル時刻でフォーマット（改善版）"""
     try:
+        # タイムゾーン情報を考慮したパース
         utc_time = datetime.fromisoformat(iso_str.replace('Z', '+00:00'))
         local_time = utc_time.astimezone()
-        return local_time.strftime('%Y-%m-%d %H:%M')
+        return local_time.strftime('%Y-%m-%d %H:%M')  # 秒を削除
     except ValueError:
+        # フォールバック処理：オリジナルからTをスペースに置換し秒を削除
         cleaned = iso_str.replace('T', ' ')[:16]
         return cleaned if len(cleaned) == 16 else iso_str[:16]
     except Exception as e:
         print(f"{COLOR['error']}日付変換エラー: {e}{COLOR['reset']}")
-        return iso_str[:16]
+        return iso_str[:16]  # 最低限のフォーマット整形
 
 async def fetch_models(session: aiohttp.ClientSession) -> list:
+    """モデルリストとインストール日時を取得"""
     try:
         async with session.get(f"{OLLAMA_API_URL}/api/tags") as response:
             data = await response.json()
@@ -45,6 +49,7 @@ async def fetch_models(session: aiohttp.ClientSession) -> list:
         return []
 
 def display_model_selection(models: list) -> None:
+    """モデル選択画面（日付表示追加）"""
     print(f"\n{COLOR['prompt']}{'No.':<4} {'モデル名':<20} {'インストール日時':<19}{COLOR['reset']}")
     print(f"{COLOR['prompt']}{'─'*4} {'─'*20} {'─'*19}{COLOR['reset']}")
     
@@ -60,6 +65,7 @@ def display_model_selection(models: list) -> None:
     print(f"\n{COLOR['prompt']}0: 終了{COLOR['reset']}")
 
 async def select_model(session: aiohttp.ClientSession) -> Optional[str]:
+    """モデル選択処理（変更なし）"""
     models = await fetch_models(session)
     if not models:
         return None
@@ -77,24 +83,42 @@ async def select_model(session: aiohttp.ClientSession) -> Optional[str]:
         except KeyboardInterrupt:
             return None
 
-async def stream_response(session: aiohttp.ClientSession, messages: list) -> None:
-    """会話履歴を丸ごと送信し、ストリーミングレスポンスを受け取る"""
-    if not messages:
-        return
-
-    # 最後に送ったユーザーの入力からモデル名を取得
-    model = messages[-1]["model"]
+async def stream_response(session: aiohttp.ClientSession, model: str, messages: list) -> str:
+    """ストリーミング処理+履歴管理対応版"""
     payload = {
         "model": model,
-        "messages": [
-            {"role": msg["role"], "content": msg["content"]} 
-            for msg in messages if msg["role"] in ["system", "user", "assistant"]
-        ],
-        "stream": True
+        "messages": messages,
+        "stream": True,
+        "options": {"temperature": 0.7, "num_ctx": 4096}
     }
 
-    print(f"\n{COLOR['model']}{model}: {COLOR['reset']}", end="", flush=True)
+    print(f"\n{COLOR['model']}{model}: {COLOR['reset']}", end='', flush=True)
+    full_response = ""
+    
+    try:
+        async with session.post(f"{OLLAMA_API_URL}/api/chat", json=payload) as resp:
+            buffer = ""
+            async for chunk in resp.content:
+                buffer += chunk.decode('utf-8')
+                while '\n' in buffer:
+                    line, buffer = buffer.split('\n', 1)
+                    if line.strip():
+                        try:
+                            data = json.loads(line)
+                            content = data["message"]["content"]
+                            print(content, end='', flush=True)
+                            full_response += content  # 完全なレスポンスを蓄積
+                        except (json.JSONDecodeError, KeyError):
+                            continue
+            print("\n" + "-"*60)
+            return full_response  # 完全なレスポンスを返却
+            
+    except aiohttp.ClientError as e:
+        print(f"\n{COLOR['error']}Network Error: {type(e).__name__}{COLOR['reset']}")
+        return ""
 
+    print(f"\n{COLOR['model']}{model}: {COLOR['reset']}", end="", flush=True)
+    
     try:
         async with session.post(
             f"{OLLAMA_API_URL}/api/chat",
@@ -102,7 +126,6 @@ async def stream_response(session: aiohttp.ClientSession, messages: list) -> Non
             timeout=300
         ) as response:
             buffer = ""
-            assistant_text = ""
             async for chunk in response.content:
                 if chunk:
                     buffer += chunk.decode()
@@ -111,14 +134,9 @@ async def stream_response(session: aiohttp.ClientSession, messages: list) -> Non
                         if line.strip():
                             try:
                                 data = json.loads(line)
-                                content = data["message"]["content"]
-                                print(content, end="", flush=True)
-                                assistant_text += content
+                                print(data["message"]["content"], end="", flush=True)
                             except json.JSONDecodeError:
                                 continue
-            # レスポンスを"assistant"として履歴に追加
-            messages.append({"role": "assistant", "content": assistant_text, "model": model})
-
         print("\n" + "-"*60)
         
     except asyncio.TimeoutError:
@@ -127,32 +145,40 @@ async def stream_response(session: aiohttp.ClientSession, messages: list) -> Non
         print(f"\n{COLOR['error']}エラー: {e}{COLOR['reset']}")
 
 async def chat_session(model: str) -> None:
+    """メモリ保持機能追加版"""
     async with aiohttp.ClientSession() as session:
-        # システムプロンプトや会話履歴を保持するリスト
-        # 必要があれば最初にシステムプロンプトを追加してもよい
-        messages = []
-
+        conversation = [{"role": "system", "content": "自然な会話を心がけてください"}]  # メモリ保持用
         while True:
             try:
                 prompt = input(f"{COLOR['user']}あなた: {COLOR['reset']}").strip()
                 if prompt.lower() == "/exit":
                     return
-                if prompt:
-                    # ユーザーの入力を会話履歴に追加
-                    messages.append({"role": "user", "content": prompt, "model": model})
-                    await stream_response(session, messages)
+                if not prompt:
+                    continue
+                
+                # ユーザーメッセージを履歴に追加
+                conversation.append({"role": "user", "content": prompt})
+                
+                # ストリーミング応答処理
+                full_response = await stream_response(session, model, conversation)
+                
+                # アシスタントメッセージを履歴に追加
+                if full_response:
+                    conversation.append({"role": "assistant", "content": full_response})
+
             except KeyboardInterrupt:
                 print(f"\n{COLOR['prompt']}セッションを終了します{COLOR['reset']}")
                 return
 
 async def main():
+    """非同期メイン処理"""
     async with aiohttp.ClientSession() as session:
         while True:
-            selected_model = await select_model(session)
-            if not selected_model:
+            model = await select_model(session)
+            if not model:
                 print(f"{COLOR['prompt']}プログラムを終了します{COLOR['reset']}")
                 return
-            await chat_session(selected_model)
+            await chat_session(model)
 
 if __name__ == "__main__":
     try:
