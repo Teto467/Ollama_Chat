@@ -6,8 +6,9 @@ import aiohttp
 import subprocess
 import signal
 import time
+import unicodedata
 from datetime import datetime
-from typing import Optional, List, Dict
+from typing import Optional
 
 OLLAMA_API_URL = "http://localhost:11434"
 COLOR = {
@@ -16,8 +17,7 @@ COLOR = {
     "model": "\033[32m",
     "prompt": "\033[36m",
     "error": "\033[31m",
-    "date": "\033[33m",
-    "warning": "\033[33m"
+    "date": "\033[33m"
 }
 
 class GoToModelSelection(Exception):
@@ -32,53 +32,43 @@ def clear_screen():
     os.system('cls' if os.name == 'nt' else 'clear')
 
 def format_iso_date(iso_str: str) -> str:
-    """ISO 8601形式の日時をユーザーフレンドリーな形式に変換"""
     try:
-        # UTC時間をdatetimeオブジェクトに変換（Python 3.11以降のタイムゾーン対応）
-        dt = datetime.fromisoformat(iso_str.replace('Z', '+00:00'))
-        # ローカルタイムゾーンに変換
-        local_dt = dt.astimezone()
-        # 日本語フォーマット（例: 2025年01月27日 22時40分）
-        return local_dt.strftime('%Y年%m月%d日 %H時%M分')
-    
+        utc_time = datetime.fromisoformat(iso_str.replace('Z', '+00:00'))
+        local_time = utc_time.astimezone()
+        return local_time.strftime('%Y-%m-%d %H:%M')
     except ValueError:
-        # 不正な形式の場合のフォールバック処理
-        cleaned = iso_str.replace('T', ' ').replace('Z', '')[:16]
+        cleaned = iso_str.replace('T', ' ')[:16]
         return cleaned if len(cleaned) == 16 else iso_str[:16]
-    
     except Exception as e:
         print(f"{COLOR['error']}日付変換エラー: {e}{COLOR['reset']}")
         return iso_str[:16]
 
-
-async def fetch_models(session: aiohttp.ClientSession) -> List[Dict]:
+async def fetch_models(session: aiohttp.ClientSession) -> list:
     try:
-        async with session.get(f"{OLLAMA_API_URL}/api/tags", timeout=aiohttp.ClientTimeout(total=10)) as response:
-            if response.status != 200:
-                raise aiohttp.ClientError(f"APIエラー: {response.status}")
+        async with session.get(f"{OLLAMA_API_URL}/api/tags") as response:
             data = await response.json()
             return sorted(
-                [{
-                    "name": m["name"],
-                    "installed": format_iso_date(m["modified_at"])
-                } for m in data.get("models", [])],
+                [
+                    {
+                        "name": m["name"],
+                        "installed": format_iso_date(m["modified_at"])
+                    }
+                    for m in data.get("models", [])
+                ],
                 key=lambda x: x["installed"],
                 reverse=True
             )
-    except (aiohttp.ClientError, asyncio.TimeoutError) as e:
-        print(f"{COLOR['error']}モデル取得エラー: {type(e).__name__} - {str(e)}{COLOR['reset']}")
-        return []
-    except json.JSONDecodeError:
-        print(f"{COLOR['error']}モデルデータの解析に失敗しました{COLOR['reset']}")
+    except Exception as e:
+        print(f"{COLOR['error']}モデル取得エラー: {e}{COLOR['reset']}")
         return []
 
-def display_model_selection(models: List[Dict]) -> None:
+def display_model_selection(models: list) -> None:
     print(f"\n{COLOR['prompt']}{'No.':<4} {'モデル名':<20} {'インストール日時':<19}{COLOR['reset']}")
     print(f"{COLOR['prompt']}{'─'*4} {'─'*20} {'─'*19}{COLOR['reset']}")
     
     for i, model in enumerate(models, 1):
-        name_parts = model['name'].split(':')
-        name = f"{name_parts[0][:15]}:{name_parts[1][:3]}" if len(name_parts) > 1 else model['name'][:18]
+        name_parts = model["name"].split(":")
+        name = f"{name_parts[0][:15]}:{name_parts[1][:3]}" if len(name_parts) > 1 else model["name"][:18]
         print(
             f"{COLOR['prompt']}{i:<4} "
             f"{COLOR['model']}{name:<20} "
@@ -87,40 +77,41 @@ def display_model_selection(models: List[Dict]) -> None:
     
     print(f"\n{COLOR['prompt']}0: 戻る{COLOR['reset']}")
 
-async def select_model(session: aiohttp.ClientSession) -> Optional[str]:
-    try:
-        models = await fetch_models(session)
-        if not models:
-            print(f"{COLOR['warning']}利用可能なモデルが見つかりません{COLOR['reset']}")
-            return None
+def normalize_input_number(prompt: str) -> str:
+    while True:
+        try:
+            raw = input(prompt).strip()
+            # 全角を半角へ正規化し、その後で数字かどうかを判定
+            normalized = unicodedata.normalize('NFKC', raw)
+            if normalized.isdigit():
+                return normalized
+            print(f"{COLOR['error']}数字で入力してください{COLOR['reset']}")
+        except GoToModelSelection:
+            # Ctrl+Cでモデル選択へ戻したい場合など
+            raise
 
-        display_model_selection(models)
-        
-        while True:
-            try:
-                choice = input(f"{COLOR['prompt']}選択: {COLOR['reset']}").strip()
-                if choice == "0":
-                    return None
-                if not choice.isdigit():
-                    raise ValueError("数値を入力してください")
-                
-                index = int(choice) - 1
-                if 0 <= index < len(models):
-                    return models[index]['name']
-                
-                print(f"{COLOR['error']}1〜{len(models)}の範囲で入力してください{COLOR['reset']}")
-            
-            except ValueError as e:
-                print(f"{COLOR['error']}{e}{COLOR['reset']}")
-            except GoToModelSelection:
-                print(f"{COLOR['prompt']}操作をキャンセルしました{COLOR['reset']}")
-                return None
-    
-    except Exception as e:
-        print(f"{COLOR['error']}モデル選択エラー: {e}{COLOR['reset']}")
+async def select_model(session: aiohttp.ClientSession) -> Optional[str]:
+    models = await fetch_models(session)
+    if not models:
         return None
 
-async def stream_response(session: aiohttp.ClientSession, model: str, messages: List[Dict]) -> str:
+    display_model_selection(models)
+    
+    while True:
+        try:
+            choice = normalize_input_number(f"{COLOR['prompt']}選択: {COLOR['reset']}")
+            # 0以外はモデル名として返す
+            if choice == "0":
+                return None
+            num_choice = int(choice)
+            if 1 <= num_choice <= len(models):
+                return models[num_choice - 1]["name"]
+            print(f"{COLOR['error']}1〜{len(models)}の範囲内で入力してください{COLOR['reset']}")
+        except GoToModelSelection:
+            print(f"{COLOR['prompt']}Ctrl+Cが押されました。再度モデルを選択できます。{COLOR['reset']}")
+            return None
+
+async def stream_response(session: aiohttp.ClientSession, model: str, messages: list) -> str:
     payload = {
         "model": model,
         "messages": messages,
@@ -131,36 +122,26 @@ async def stream_response(session: aiohttp.ClientSession, model: str, messages: 
     full_response = ""
     
     try:
-        async with session.post(
-            f"{OLLAMA_API_URL}/api/chat",
-            json=payload,
-            timeout=aiohttp.ClientTimeout(total=300)
-        ) as resp:
-            
-            if resp.status != 200:
-                raise aiohttp.ClientError(f"APIエラー: {resp.status}")
-            
+        async with session.post(f"{OLLAMA_API_URL}/api/chat", json=payload) as resp:
             buffer = ""
             async for chunk in resp.content:
                 buffer += chunk.decode('utf-8')
-                while '\n' in buffer:
-                    line, buffer = buffer.split('\n', 1)
+                while "\n" in buffer:
+                    line, buffer = buffer.split("\n", 1)
                     if line.strip():
                         try:
                             data = json.loads(line)
-                            content = data.get("message", {}).get("content", "")
-                            print(content, end='', flush=True)
+                            content = data["message"]["content"]
+                            print(content, end="", flush=True)
                             full_response += content
-                        except json.JSONDecodeError:
+                        except (json.JSONDecodeError, KeyError):
                             continue
             print("\n" + "-"*60)
             return full_response
-    
-    except (aiohttp.ClientError, asyncio.TimeoutError) as e:
-        print(f"\n{COLOR['error']}通信エラー: {type(e).__name__} - {str(e)}{COLOR['reset']}")
+    except aiohttp.ClientError as e:
+        print(f"\n{COLOR['error']}Network Error: {type(e).__name__}{COLOR['reset']}")
         return ""
     except GoToModelSelection:
-        print(f"\n{COLOR['prompt']}応答生成を中断します{COLOR['reset']}")
         raise
 
 async def chat_session(model: str) -> None:
@@ -169,7 +150,7 @@ async def chat_session(model: str) -> None:
         while True:
             try:
                 prompt = input(f"{COLOR['user']}あなた: {COLOR['reset']}").strip()
-                if prompt.lower() in ("/exit", "/quit"):
+                if prompt.lower() == "/exit":
                     return
                 if not prompt:
                     continue
@@ -179,137 +160,91 @@ async def chat_session(model: str) -> None:
                 
                 if full_response:
                     conversation.append({"role": "assistant", "content": full_response})
-
             except GoToModelSelection:
                 return
             except KeyboardInterrupt:
                 print(f"\n{COLOR['prompt']}セッションを終了します{COLOR['reset']}")
                 return
-            except Exception as e:
-                print(f"\n{COLOR['error']}予期せぬエラー: {e}{COLOR['reset']}")
-                return
-
-def check_server_health() -> bool:
-    try:
-        result = subprocess.run(
-            ["curl", "-s", f"{OLLAMA_API_URL}"],
-            capture_output=True,
-            text=True,
-            timeout=5
-        )
-        return result.returncode == 0
-    except:
-        return False
 
 def start_ollama_server():
     try:
-        if check_server_health():
-            print(f"{COLOR['prompt']}Ollamaサーバーは既に起動しています{COLOR['reset']}")
-            return
-        
-        process = subprocess.Popen(
-            ["ollama", "serve"],
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL
-        )
-        
-        for _ in range(10):
-            if check_server_health():
-                print(f"{COLOR['prompt']}Ollamaサーバーが起動しました{COLOR['reset']}")
-                return
-            time.sleep(1)
-        
-        print(f"{COLOR['error']}サーバー起動がタイムアウトしました{COLOR['reset']}")
-    
+        subprocess.Popen(["ollama", "serve"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        print(f"{COLOR['prompt']}Ollamaサーバーを起動しています...{COLOR['reset']}")
     except FileNotFoundError:
-        print(f"{COLOR['error']}Ollamaがインストールされていません{COLOR['reset']}")
+        print(f"{COLOR['error']}Ollamaがインストールされていないか、パスが通っていません。{COLOR['reset']}")
     except Exception as e:
-        print(f"{COLOR['error']}サーバー起動エラー: {type(e).__name__} - {str(e)}{COLOR['reset']}")
+        print(f"{COLOR['error']}Ollamaサーバーの起動に失敗しました: {e}{COLOR['reset']}")
 
 def install_dependencies():
-    required = ['aiohttp']
     try:
-        subprocess.check_call(
-            [sys.executable, "-m", "pip", "install", "--user"] + required,
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL
-        )
-        print(f"{COLOR['prompt']}依存ライブラリのインストールが完了しました{COLOR['reset']}")
+        subprocess.check_call([sys.executable, "-m", "pip", "install", "aiohttp"])
+        print(f"{COLOR['prompt']}依存ライブラリのインストールが完了しました。{COLOR['reset']}")
     except subprocess.CalledProcessError:
-        print(f"{COLOR['error']}依存ライブラリのインストールに失敗しました{COLOR['reset']}")
-    except Exception as e:
-        print(f"{COLOR['error']}インストールエラー: {type(e).__name__} - {str(e)}{COLOR['reset']}")
+        print(f"{COLOR['error']}依存ライブラリのインストールに失敗しました。{COLOR['reset']}")
 
 async def run_ollama_and_chat():
     start_ollama_server()
-    if not check_server_health():
-        print(f"{COLOR['error']}サーバー起動を確認できませんでした{COLOR['reset']}")
-        return
-    
-    try:
-        async with aiohttp.ClientSession() as session:
-            model = await select_model(session)
-            if model:
-                await chat_session(model)
-    except Exception as e:
-        print(f"{COLOR['error']}実行エラー: {e}{COLOR['reset']}")
+    time.sleep(0.5)
+    async with aiohttp.ClientSession() as session:
+        print(f"{COLOR['prompt']}モデルを選択してください{COLOR['reset']}")
+        model = await select_model(session)
+        if model:
+            await chat_session(model)
+
 
 async def main_menu():
     while True:
-        clear_screen()
-        print(f"{COLOR['prompt']}==============================")
-        print(" Ollama 統合管理ツール")
-        print("==============================")
-        print("1. Ollamaサーバーを起動")
-        print("2. チャットプログラムを実行")
-        print("3. 依存ライブラリをインストール")
-        print("4. サーバー起動 → チャットプログラムを実行")
-        print("5. 終了")
-        print(f"=============================={COLOR['reset']}")
-        
         try:
-            choice = input(f"{COLOR['prompt']}番号を選択してください（1-5）: {COLOR['reset']}").strip()
+            clear_screen()
+            print(f"{COLOR['prompt']}==============================")
+            print(" Ollama 統合管理ツール")
+            print("==============================")
+            print("1. Ollamaサーバーを起動")
+            print("2. チャットプログラムを実行")
+            print("3. 依存ライブラリをインストール")
+            print("4. サーバー起動 → チャットプログラムを実行")
+            print("5. 終了")
+            print(f"=============================={COLOR['reset']}")
             
-            if choice == "1":
+            in_choice = normalize_input_number(f"{COLOR['prompt']}番号を選択してください（1-5）: {COLOR['reset']}")
+            choice = int(in_choice)
+            
+            if choice == 1:
                 start_ollama_server()
-                input(f"{COLOR['prompt']}Enterキーでメニューに戻ります...{COLOR['reset']}")
-            elif choice == "2":
+                input(f"{COLOR['prompt']}Enterキーを押してメインメニューに戻ります...{COLOR['reset']}")
+            elif choice == 2:
                 async with aiohttp.ClientSession() as session:
                     while True:
                         model = await select_model(session)
                         if not model:
                             break
                         await chat_session(model)
-            elif choice == "3":
+            elif choice == 3:
                 install_dependencies()
-                input(f"{COLOR['prompt']}Enterキーでメニューに戻ります...{COLOR['reset']}")
-            elif choice == "4":
+                input(f"{COLOR['prompt']}Enterキーを押してメインメニューに戻ります...{COLOR['reset']}")
+            elif choice == 4:
                 await run_ollama_and_chat()
-                input(f"{COLOR['prompt']}Enterキーでメニューに戻ります...{COLOR['reset']}")
-            elif choice == "5":
+                input(f"{COLOR['prompt']}Enterキーを押してメインメニューに戻ります...{COLOR['reset']}")
+            elif choice == 5:
                 print(f"{COLOR['prompt']}プログラムを終了します{COLOR['reset']}")
                 return
             else:
-                print(f"{COLOR['error']}1〜5の数値を入力してください{COLOR['reset']}")
-                await asyncio.sleep(1)
-        
+                print(f"{COLOR['error']}正しい番号を入力してください（1-5）{COLOR['reset']}")
+                await asyncio.sleep(2)
+                
         except GoToModelSelection:
-            print(f"{COLOR['prompt']}操作をキャンセルしました{COLOR['reset']}")
-            continue  # ループを継続
-        except Exception as e:
-            print(f"{COLOR['error']}予期せぬエラー: {e}{COLOR['reset']}")
-            await asyncio.sleep(2)
-
-if __name__ == "__main__":
-    import platform
-    if platform.system() == 'Windows':
-        asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
-    
-    while True:
-        try:
-            asyncio.run(main_menu())
-        except GoToModelSelection:
-            print(f"\n{COLOR['prompt']}メインメニューに戻ります{COLOR['reset']}")
+            print(f"{COLOR['prompt']}Ctrl+Cが押されました。メインメニューに戻ります。{COLOR['reset']}")
+            await asyncio.sleep(1)
         except KeyboardInterrupt:
             print(f"\n{COLOR['prompt']}プログラムを終了します{COLOR['reset']}")
-            break
+            return
+        except Exception as e:
+            print(f"{COLOR['error']}予期せぬエラーが発生しました: {e}{COLOR['reset']}")
+            await asyncio.sleep(2)
+
+
+if __name__ == "__main__":
+    try:
+        asyncio.run(main_menu())
+    except KeyboardInterrupt:
+        print(f"\n{COLOR['prompt']}プログラムを終了します{COLOR['reset']}")
